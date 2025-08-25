@@ -12,6 +12,7 @@ import {cn} from '../lib/utils';
 import audioLogo from '../assets/audio-logo.png';
 import {useApi} from '../hooks/useApi';
 import {TranscriptMessage, LevelsMessage} from '../lib/websocket';
+import {SettingsModal, GigaChatSettings} from './SettingsModal';
 
 type RecordingState = 'idle' | 'recording' | 'paused';
 
@@ -28,6 +29,8 @@ const AudioRecorder = () => {
     updateSettings,
     saveTranscript,
     summarize,
+    gigachatSettings,
+    saveGigaChatSettings,
     setupWebSocket,
   } = useApi();
 
@@ -43,6 +46,7 @@ const AudioRecorder = () => {
   const [summary, setSummary] = useState("");
   const [recordingTime, setRecordingTime] = useState(0);
   const recordingStartTime = useRef<number>(0);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   // Sync with backend state
   useEffect(() => {
@@ -211,6 +215,10 @@ const AudioRecorder = () => {
     }
   };
 
+  const handleSaveGigaChatSettings = async (settings: GigaChatSettings) => {
+    await saveGigaChatSettings.mutateAsync(settings);
+  };
+
   const getStatusInfo = () => {
     switch (recordingState) {
       case 'recording':
@@ -225,11 +233,11 @@ const AudioRecorder = () => {
   const status = getStatusInfo();
 
   return (
-    <div className="min-h-screen bg-background p-6">
-      <div className="max-w-7xl mx-auto space-y-6">
+    <div className="h-screen bg-background p-4 overflow-hidden">
+      <div className="h-full max-w-7xl mx-auto flex flex-col">
         
         {/* Header */}
-        <header className="flex items-center justify-between">
+        <header className="flex items-center justify-between mb-4 flex-shrink-0">
           <div className="flex items-center space-x-4">
             <div className="flex items-center space-x-3">
               <div className="relative">
@@ -262,16 +270,20 @@ const AudioRecorder = () => {
               <div className="w-2 h-2 rounded-full bg-current mr-2 animate-pulse" />
               {status.text}
             </Badge>
-            <Button variant="outline" size="sm">
+            <Button 
+              variant="outline" 
+              size="sm"
+              onClick={() => setIsSettingsOpen(true)}
+            >
               <Settings className="w-4 h-4" />
             </Button>
           </div>
         </header>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 flex-1 min-h-0">
           
           {/* Audio Controls */}
-          <div className="lg:col-span-1 space-y-6">
+          <div className="lg:col-span-1 space-y-4 overflow-y-auto">
             
             {/* Microphone Settings */}
             <Card className="bg-gradient-card border-border shadow-card">
@@ -454,11 +466,11 @@ const AudioRecorder = () => {
           </div>
 
           {/* Transcript and Summary */}
-          <div className="lg:col-span-2 grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 grid grid-cols-1 lg:grid-cols-3 gap-4">
             
             {/* Transcript */}
             <div className="lg:col-span-2">
-              <Card className="bg-gradient-card border-border shadow-card h-[600px]">
+              <Card className="bg-gradient-card border-border shadow-card h-full">
                 <CardHeader className="pb-3">
                   <CardTitle className="text-lg">Транскрипт</CardTitle>
                 </CardHeader>
@@ -475,7 +487,7 @@ const AudioRecorder = () => {
 
             {/* Summary */}
             <div className="lg:col-span-1">
-              <Card className="bg-gradient-card border-border shadow-card h-[600px]">
+              <Card className="bg-gradient-card border-border shadow-card h-full">
                 <CardHeader className="pb-3">
                   <CardTitle className="text-lg flex items-center justify-between">
                     Саммари
@@ -504,11 +516,23 @@ const AudioRecorder = () => {
         </div>
 
         {/* Status Bar */}
-        <div className="flex items-center justify-between text-xs text-muted-foreground bg-card border border-border rounded-lg px-4 py-2">
-          <span>Готов к записи</span>
-          <span>GigaAM v2 RNNT • GigaChat 2-max</span>
+        <div className="flex items-center justify-between text-xs text-muted-foreground bg-card border border-border rounded-lg px-4 py-2 flex-shrink-0">
+          <span>GigaAM v2 RNNT • GigaChat-2-Max</span>
+          <span>RRKOR™ • 2025</span>
         </div>
       </div>
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        onSave={handleSaveGigaChatSettings}
+        currentSettings={{
+          credentials: gigachatSettings.data?.credentials || "",
+          scope: gigachatSettings.data?.scope || "",
+          model: gigachatSettings.data?.model || "GigaChat-2-Pro",
+        }}
+      />
     </div>
   );
 };

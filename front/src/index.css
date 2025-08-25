@@ -124,6 +124,32 @@ All colors MUST be HSL.
 
   body {
     @apply bg-background text-foreground;
+    overflow-x: hidden;
+  }
+
+  /* Responsive font scaling */
+  @media (max-width: 1400px) {
+    html {
+      font-size: 95%;
+    }
+  }
+
+  @media (max-width: 1200px) {
+    html {
+      font-size: 90%;
+    }
+  }
+
+  @media (max-width: 1000px) {
+    html {
+      font-size: 85%;
+    }
+  }
+
+  @media (max-width: 800px) {
+    html {
+      font-size: 80%;
+    }
   }
 
   /* Audio interface animations */
@@ -176,5 +202,42 @@ All colors MUST be HSL.
 
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
     background: hsl(var(--accent));
+  }
+
+  /* Dialog improvements */
+  [data-radix-dialog-content] {
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+  }
+
+  /* Better spacing for dialogs */
+  .dialog-content {
+    display: flex;
+    flex-direction: column;
+    max-height: 90vh;
+  }
+
+  .dialog-body {
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  .dialog-footer {
+    flex-shrink: 0;
+    border-top: 1px solid hsl(var(--border));
+    padding-top: 1rem;
+  }
+
+  /* Responsive grid improvements */
+  @media (max-width: 1200px) {
+    .responsive-grid {
+      grid-template-columns: 1fr 2fr;
+    }
+  }
+
+  @media (max-width: 800px) {
+    .responsive-grid {
+      grid-template-columns: 1fr;
+    }
   }
 }

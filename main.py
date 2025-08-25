@@ -137,6 +137,11 @@ class State:
         # Флаг для перезапуска аудио потоков при ошибках
         self.audio_stream_error = False
 
+        # GigaChat настройки
+        self.gigachat_credentials = ""
+        self.gigachat_scope = ""
+        self.gigachat_model = "GigaChat-2-Pro"
+
         # текст
         self.transcript_text = ""
 
@@ -148,14 +153,42 @@ class State:
 
         # GigaChat
         load_dotenv()
-        giga_auth = os.getenv("GIGACHAT_CREDENTIALS")
-        scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
-        self.gigachat = GigaChat(
-            credentials=giga_auth,
-            scope=scope,
-            model="GigaChat-2-Max",
-            verify_ssl_certs=False,
-        )
+        
+        # Загружаем настройки из файла или переменных окружения
+        config_path = os.path.join(os.path.dirname(__file__), "gigachat_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                giga_auth = config.get("GIGACHAT_CREDENTIALS", "")
+                scope = config.get("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
+                model = config.get("GIGACHAT_MODEL", "GigaChat-2-Pro")
+            except Exception as e:
+                logger.warning(f"Ошибка загрузки конфигурации GigaChat: {e}")
+                giga_auth = os.getenv("GIGACHAT_CREDENTIALS", "")
+                scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
+                model = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Pro")
+        else:
+            giga_auth = os.getenv("GIGACHAT_CREDENTIALS", "")
+            scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
+            model = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Pro")
+        
+        # Сохраняем настройки в STATE
+        self.gigachat_credentials = giga_auth
+        self.gigachat_scope = scope
+        self.gigachat_model = model
+        
+        # Инициализируем GigaChat только если есть credentials
+        if giga_auth:
+            self.gigachat = GigaChat(
+                credentials=giga_auth,
+                scope=scope,
+                model=model,
+                verify_ssl_certs=False,
+            )
+        else:
+            self.gigachat = None
+            logger.warning("GigaChat не инициализирован - отсутствуют credentials")
 
         # GigaAM модель лениво загружаем в треде транскрипции
         self.gigaam_model = None
@@ -499,6 +532,11 @@ class SettingsPatch(BaseModel):
 class SummarizeBody(BaseModel):
     text: str | None = None
 
+class GigaChatSettings(BaseModel):
+    credentials: str
+    scope: str
+    model: str
+
 # --------- Вспомогательные ---------
 def ensure_blackhole():
     for dev in sd.query_devices():
@@ -677,6 +715,41 @@ def api_update_settings(body: SettingsPatch):
         "mic_silence_threshold": STATE.mic_silence_threshold,
         "blackhole_silence_threshold": STATE.blackhole_silence_threshold,
     }}
+
+@app.get("/api/gigachat-settings")
+def api_get_gigachat_settings():
+    """Получить текущие настройки GigaChat"""
+    return {
+        "credentials": STATE.gigachat_credentials,
+        "scope": STATE.gigachat_scope,
+        "model": STATE.gigachat_model,
+    }
+
+@app.post("/api/gigachat-settings")
+def api_save_gigachat_settings(body: GigaChatSettings):
+    """Сохранить настройки GigaChat"""
+    try:
+        # Сохраняем в STATE
+        STATE.gigachat_credentials = body.credentials
+        STATE.gigachat_scope = body.scope
+        STATE.gigachat_model = body.model
+        
+        # Сохраняем в файл конфигурации
+        config = {
+            "GIGACHAT_CREDENTIALS": body.credentials,
+            "GIGACHAT_SCOPE": body.scope,
+            "GIGACHAT_MODEL": body.model,
+        }
+        
+        config_path = os.path.join(os.path.dirname(__file__), "gigachat_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        logger.info("GigaChat settings saved successfully")
+        return {"ok": True, "message": "Настройки GigaChat сохранены"}
+    except Exception as e:
+        logger.error(f"Error saving GigaChat settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/transcript")
 def api_get_transcript():
