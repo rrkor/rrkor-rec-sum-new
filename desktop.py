@@ -1,82 +1,62 @@
+# desktop.py
 import os
-import socket
 import sys
-import threading
 import time
-from contextlib import closing
+import socket
+import threading
 from pathlib import Path
 
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl
 from PyQt5.QtNetwork import QNetworkProxyFactory
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtWidgets import QApplication
-from flask import send_from_directory, jsonify
 
-import main as backend
+from flask import send_from_directory, jsonify, request
+import main as backend  # НЕ трогаем вашу бизнес-логику, только статику
 
+# без прокси для локалки
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-proxy-server")
 
 DEFAULT_HOST = "127.0.0.1"
-FRONT_ENV = os.environ.get("FRONT_BUILD_DIR", "").strip()
+DEFAULT_PORT = 5000
 
-def find_frontend_dir(base: Path) -> Path:
-    candidates = []
-    if FRONT_ENV:
-        candidates.append(Path(FRONT_ENV))
-    candidates += [
-        base / "static",
-        base / "web",
-        base / "frontend" / "dist",
-        base / "frontend" / "build",
-        base / "dist",
-        base / "build",
-    ]
-    for p in candidates:
-        if (p / "index.html").exists():
-            return p
-    raise RuntimeError("Нет сборки фронта: положи полный build (index.html + assets/*) в ./static")
+# фиксированный путь к билду фронта
+BASE_DIR = Path(backend.__file__).parent.resolve()
+FRONT_DIR = BASE_DIR / "front" / "dist"   # <— ТОЛЬКО здесь ищем фронт
 
-def find_free_port(start=5000, end=5099) -> int:
-    for port in range(start, end + 1):
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind((DEFAULT_HOST, port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError("Нет свободного порта 5000–5099")
+def patch_static_and_spa(app):
+    """
+    Статически отдаём front/dist, плюс SPA-fallback.
+    /api/* не трогаем.
+    """
+    if not FRONT_DIR.exists() or not (FRONT_DIR / "index.html").exists():
+        raise RuntimeError(f"Не найден фронт-билд: {FRONT_DIR}. Собери его в front/dist.")
 
-def _route_exists(app, rule: str) -> bool:
-    try:
-        for r in app.url_map.iter_rules():
-            if r.rule == rule:
-                return True
-    except Exception:
-        pass
-    return False
-
-def patch_backend_static(app, web_dir: Path):
-    app.static_folder = str(web_dir)
+    app.static_folder = str(FRONT_DIR)
 
     def serve_index():
         return send_from_directory(app.static_folder, "index.html")
 
-    if not _route_exists(app, "/"):
+    # Корень
+    if "/" not in {r.rule for r in app.url_map.iter_rules()}:
         app.add_url_rule("/", "index_desktop_launcher", serve_index, methods=["GET"])
 
+    # Отдача ассетов и SPA-фоллбек
     @app.route("/<path:filename>", methods=["GET"])
-    def _static_catch_all__desktop_launcher(filename: str):
-        candidate = Path(app.static_folder) / filename
+    def _static_or_spa(filename: str):
+        # если файл существует — отдать как статику
+        candidate = FRONT_DIR / filename
         if candidate.is_file():
             return send_from_directory(app.static_folder, filename)
+        # API — не перехватываем
         if filename.startswith("api"):
             return jsonify(error="Not found"), 404
+        # иначе это SPA-роут
         return serve_index()
 
-def run_flask(app, port: int):
-    app.run(host=DEFAULT_HOST, port=port, debug=False, use_reloader=False, threaded=True)
+def run_flask(app):
+    app.run(host=DEFAULT_HOST, port=DEFAULT_PORT, debug=False, use_reloader=False, threaded=True)
 
 def wait_http_ok(url: str, timeout_sec: int = 10):
     import urllib.request, urllib.error
@@ -92,16 +72,13 @@ def wait_http_ok(url: str, timeout_sec: int = 10):
     return False
 
 def main():
-    base_dir = Path(backend.__file__).parent.resolve()
-    web_dir = find_frontend_dir(base_dir)
-    print(f"[desktop] frontend dir: {web_dir}")
-    patch_backend_static(backend.app, web_dir)
+    # подменяем только статику/SPA. вся ваша логика и роуты остаются как есть
+    patch_static_and_spa(backend.app)
 
-    port = find_free_port()
-    t = threading.Thread(target=run_flask, args=(backend.app, port), daemon=True)
+    t = threading.Thread(target=run_flask, args=(backend.app,), daemon=True)
     t.start()
 
-    url = f"http://{DEFAULT_HOST}:{port}/"
+    url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/"
     wait_http_ok(url, timeout_sec=10)
 
     QNetworkProxyFactory.setUseSystemConfiguration(False)

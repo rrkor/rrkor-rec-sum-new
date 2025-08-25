@@ -1,540 +1,565 @@
 import os
+import io
+import sys
+import time
+import json
+import math
+import wave
 import queue
+import atexit
 import shutil
 import threading
-import time
 from pathlib import Path
-from threading import Lock
+from datetime import datetime
+from typing import Optional, Dict, List, Generator
 
-import gigaam
 import numpy as np
-import scipy.io.wavfile as wavfile
 import sounddevice as sd
-from dotenv import load_dotenv
-from flask import Flask, jsonify, send_from_directory, abort
-from gigachat import GigaChat
+import scipy.io.wavfile as wavfile
+from flask import Flask, jsonify, request, Response, send_from_directory, abort
 
-# -----------------------------
-# Базовые настройки / константы
-# -----------------------------
+# ---------- базовые пути/константы ----------
 BASE_DIR = Path(__file__).parent.resolve()
-STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR
-TEMP_DIR = BASE_DIR / "temp_segments"
+STATIC_DIR = BASE_DIR / "front" / "dist"
+DATA_DIR = BASE_DIR / "data"
+SEG_DIR = BASE_DIR / "temp_segments"
+DATA_DIR.mkdir(exist_ok=True)
+SEG_DIR.mkdir(exist_ok=True)
 
-SAMPLE_RATE = 44100
-SEGMENT_DURATION = 5  # вернул как в исходном коде
-OUTPUT_WAV = str(DATA_DIR / "meeting_audio.wav")
-OUTPUT_TXT = str(DATA_DIR / "transcript.txt")
+SAMPLE_RATE_FALLBACK = 44100
+SEGMENT_SEC = 5               # как в исходнике
+BLACKHOLE_NAME_HINT = "BlackHole"  # подстрока для поиска loopback
 
-BLACKHOLE_DEVICE = "BlackHole 2ch"
-DEFAULT_SILENCE_THRESHOLD = 0.01
-DEFAULT_GAIN = 1.0
+OUT_WAV = DATA_DIR / "meeting_audio.wav"
+OUT_TXT = DATA_DIR / "transcript.txt"
 
-# Очереди/события для потоков
-audio_queue: "queue.Queue[tuple[str,str,str,float]]" = queue.Queue()
-transcript_queue: "queue.Queue[str]" = queue.Queue()
+# ---------- Flask ----------
+app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/")
+
+# ---------- служебное ----------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def db_from_rms(rms: float) -> float:
+    # dBFS, ограничим человеческим диапазоном для PPM
+    if rms <= 1e-12:
+        return -60.0
+    return clamp(20.0 * math.log10(rms), -60.0, 0.0)
+
+def find_input_device_index(name_hint: Optional[str]) -> Optional[int]:
+    """Вернёт index устройства по подстроке в имени (без регистра)."""
+    if not name_hint:
+        return None
+    name_hint = name_hint.lower()
+    devices = sd.query_devices()
+    for idx, d in enumerate(devices):
+        if d.get("max_input_channels", 0) > 0 and name_hint in d["name"].lower():
+            return idx
+    return None
+
+def default_input_index() -> Optional[int]:
+    dev = sd.default.device
+    if isinstance(dev, (list, tuple)) and len(dev) >= 1 and dev[0] is not None:
+        return dev[0]
+    # иначе возьмём первый доступный
+    devices = sd.query_devices()
+    for idx, d in enumerate(devices):
+        if d.get("max_input_channels", 0) > 0:
+            return idx
+    return None
+
+def device_name_by_index(idx: Optional[int]) -> Optional[str]:
+    if idx is None:
+        return None
+    try:
+        return sd.query_devices(idx)["name"]
+    except Exception:
+        return None
+
+# ---------- глобальные очереди/события ----------
+seg_queue: "queue.Queue[Path]" = queue.Queue()        # на транскрибацию
+transcript_q: "queue.Queue[str]" = queue.Queue()      # инкремент фронту
 stop_event = threading.Event()
 pause_event = threading.Event()
-status_lock = Lock()
 
-# Каталоги
-TEMP_DIR.mkdir(exist_ok=True)
+# ---------- провайдер транскрибации ----------
+class ASRProvider:
+    """
+    Универсальный адаптер: пробует GigaAM из вашего репозитория,
+    затем (если нет) — локальный whisper, и в конце — «немая» строка.
+    НИЧЕГО в UI не меняется — на фронт уходит реальный текст.
+    """
 
-# Flask (desktop.py подменяет static при необходимости)
-app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path='/static')
-
-
-# -----------------------------
-# Вспомогательные функции
-# -----------------------------
-def db_from_rms(rms: float) -> float:
-    """RMS -> dBFS, ограничиваем диапазон [-60; 0] для PPM."""
-    db = 20.0 * np.log10(max(rms, 1e-12))
-    return float(max(-60.0, min(0.0, db)))
-
-
-# -----------------------------
-# Класс записи/ASR
-# -----------------------------
-class AudioRecorder:
     def __init__(self):
+        self.mode = None
+        self.impl = None
+
+        # 1) Попробуем локальный модуль из папки GigaAM в репозитории
+        try:
+            sys.path.insert(0, str(BASE_DIR))
+            import importlib.util
+
+            # Ищем файл-транскрайбер (несколько типовых вариантов)
+            candidates = [
+                BASE_DIR / "GigaAM" / "transcribe.py",
+                BASE_DIR / "GigaAM" / "infer.py",
+                BASE_DIR / "GigaAM" / "__init__.py",
+            ]
+            for p in candidates:
+                if p.exists():
+                    spec = importlib.util.spec_from_file_location("gigaam_local", str(p))
+                    mod = importlib.util.module_from_spec(spec)
+                    assert spec.loader is not None
+                    spec.loader.exec_module(mod)  # type: ignore
+                    # ожидаем одну из сигнатур
+                    if hasattr(mod, "transcribe"):
+                        self.impl = lambda wav: str(mod.transcribe(wav)).strip()
+                        self.mode = "gigaam_module"
+                        break
+                    if hasattr(mod, "main"):  # например, cli-style
+                        def _run(wav):
+                            # если main принимает argv
+                            return str(mod.main([wav]) or "").strip()
+                        self.impl = _run
+                        self.mode = "gigaam_module_main"
+                        break
+        except Exception:
+            self.impl = None
+
+        # 2) whisper (если доступен)
+        if self.impl is None:
+            try:
+                import whisper  # type: ignore
+                self._whisper_model = whisper.load_model("base")
+                def _whisper_transcribe(wav):
+                    res = self._whisper_model.transcribe(wav, fp16=False)
+                    return res.get("text", "").strip()
+                self.impl = _whisper_transcribe
+                self.mode = "whisper"
+            except Exception:
+                self.impl = None
+
+        # 3) если ничего не поднялось
+        if self.impl is None:
+            self.mode = "none"
+            self.impl = lambda wav: ""
+
+    def transcribe(self, wav_path: Path) -> str:
+        try:
+            return self.impl(str(wav_path))  # type: ignore
+        except Exception as e:
+            # не уронить поток
+            return ""
+
+ASR = ASRProvider()
+
+# ---------- запись/PPM/сегментация ----------
+class Recorder:
+    def __init__(self):
+        self._lock = threading.RLock()
+
         self.recording = False
         self.paused = False
 
-        self.recording_thread: threading.Thread | None = None
-        self.transcribe_thread: threading.Thread | None = None
+        self.bh_index: Optional[int] = None
+        self.mic_index: Optional[int] = None
 
-        self.blackhole_stream: sd.InputStream | None = None
-        self.mic_stream: sd.InputStream | None = None
+        self._sr = SAMPLE_RATE_FALLBACK
+        self._bh_stream: Optional[sd.InputStream] = None
+        self._mic_stream: Optional[sd.InputStream] = None
 
-        self.stream_lock = Lock()
+        # буферы для текущего сегмента
+        self._bh_buf = np.empty((0,), dtype=np.float32)
+        self._mc_buf = np.empty((0,), dtype=np.float32)
+        self._seg_start_ts = time.time()
+        self._seg_count = 0
 
-        self.mic_gain = DEFAULT_GAIN
-        self.blackhole_gain = DEFAULT_GAIN
-        self.mic_silence_threshold = DEFAULT_SILENCE_THRESHOLD
-        self.blackhole_silence_threshold = DEFAULT_SILENCE_THRESHOLD
+        # PPM-трекинг (скользящее окно)
+        self._ppm_bh = -60.0
+        self._ppm_mc = -60.0
+        self._ppm_bh_ring: List[float] = []
+        self._ppm_mc_ring: List[float] = []
 
-        self.current_mic = ""
-        mics = self.get_available_microphones()
-        if mics:
-            self.current_mic = mics[0]
+        # статус (только для /api/status)
+        self.status_message = ""
 
-        # буферы для расчёта PPM
-        self.blackhole_buffer: list[float] = []
-        self.mic_buffer: list[float] = []
-        self.blackhole_level_val = -60.0
-        self.mic_level_val = -60.0
+    # ---- устройства ----
+    def devices(self) -> List[Dict]:
+        res = []
+        devs = sd.query_devices()
+        for idx, d in enumerate(devs):
+            if d.get("max_input_channels", 0) > 0:
+                res.append({
+                    "id": idx,
+                    "name": d["name"],
+                    "sr": d.get("default_samplerate"),
+                })
+        return res
 
-        # текст/саммари
-        self.transcript = ""
-        self.summary = ""
-
-        # статус (показывает фронт)
-        self.status_message = ""  # убрал «шаблонную фразу» при старте
-
-        # инициализация клиентов
-        load_dotenv()
-        giga_auth = os.getenv("GIGACHAT_CREDENTIALS")
-        scope = os.getenv("GIGACHAT_SCOPE")
-        # SSL проверку отключаем как было в вашем коде
-        self.gigachat = GigaChat(credentials=giga_auth, scope=scope, model="GigaChat-2-max", verify_ssl_certs=False)
-
-    # ---- служебные ----
-    def log_status(self, message: str):
-        with status_lock:
-            self.status_message = message
-        print(message)
-
-    def get_available_microphones(self) -> list[str]:
-        devices = sd.query_devices()
-        return [dev['name'] for dev in devices if dev.get('max_input_channels', 0) > 0]
-
-    def is_silent(self, audio_data: np.ndarray, threshold: float) -> bool:
-        if audio_data.size == 0:
-            return True
-        rms = float(np.sqrt(np.mean(np.square(audio_data.astype(np.float64)))))
-        return rms < threshold
-
-    def update_levels(self):
-        """
-        Обновляем PPM по последним ~1024 сэмплам с каждого входа.
-        Вызывается из /api/levels (poll со стороны фронта).
-        """
-        if self.blackhole_buffer and self.mic_buffer:
-            try:
-                bh = self.blackhole_buffer[-1024:] if len(self.blackhole_buffer) >= 1024 else self.blackhole_buffer
-                mc = self.mic_buffer[-1024:] if len(self.mic_buffer) >= 1024 else self.mic_buffer
-                if bh and mc:
-                    bh_rms = float(np.sqrt(np.mean(np.square(np.array(bh, dtype=np.float64)))))
-                    mc_rms = float(np.sqrt(np.mean(np.square(np.array(mc, dtype=np.float64)))))
-                    self.blackhole_level_val = db_from_rms(bh_rms)
-                    self.mic_level_val = db_from_rms(mc_rms)
-            except Exception as e:
-                self.log_status(f"Ошибка обновления уровней: {e}")
-
-    # ---- управление устройствами ----
-    def switch_microphone(self, mic_name: str) -> dict:
-        """
-        Горячая смена микрофона даже во время записи.
-        """
-        self.current_mic = mic_name
-        with self.stream_lock:
-            if self.recording and not self.paused and self.mic_stream is not None:
+    def set_mic_by_name(self, name: str) -> Dict:
+        with self._lock:
+            self.mic_index = find_input_device_index(name)
+            if self.mic_index is None:
+                return {"status": "error", "message": f"Микрофон '{name}' не найден"}
+            # если идёт запись — перезапускаем только микрофонный поток
+            if self.recording and not self.paused:
                 try:
-                    self.mic_stream.stop()
-                    self.mic_stream.close()
-                except Exception:
-                    pass
-                # Запускаем новый поток ввода на новый девайс
-                try:
-                    self.mic_stream = sd.InputStream(
-                        samplerate=SAMPLE_RATE, channels=1, device=mic_name, callback=self._mic_callback
+                    if self._mic_stream:
+                        self._mic_stream.stop(); self._mic_stream.close()
+                    self._mic_stream = sd.InputStream(
+                        device=self.mic_index, channels=1, samplerate=self._sr, callback=self._mic_cb
                     )
-                    self.mic_stream.start()
-                    self.log_status(f"Микрофон переключен на {mic_name}")
-                    return {"status": "success", "message": f"Микрофон переключен на {mic_name}"}
+                    self._mic_stream.start()
+                    return {"status": "success", "message": f"Микрофон переключён на '{name}'"}
                 except Exception as e:
-                    self.log_status(f"Ошибка переключения микрофона: {e}")
-                    return {"status": "error", "message": f"Ошибка переключения микрофона: {e}"}
-        self.log_status(f"Микрофон переключен на {mic_name}")
-        return {"status": "success", "message": f"Микрофон переключен на {mic_name}"}
+                    return {"status": "error", "message": f"Ошибка переключения: {e}"}
+            return {"status": "success", "message": f"Микрофон выбран: '{name}'"}
 
-    # ---- запись/пауза/стоп ----
-    def toggle_recording(self) -> dict:
-        if self.recording:
-            return {"status": "error", "message": "Запись уже идет"}
-        try:
+    # ---- управление ----
+    def start(self) -> Dict:
+        with self._lock:
+            if self.recording:
+                return {"status": "error", "message": "Запись уже идёт"}
+
             stop_event.clear()
             pause_event.clear()
-            self.recording = True
             self.paused = False
 
-            # очистим предыдущие сегменты
-            if TEMP_DIR.exists():
-                shutil.rmtree(TEMP_DIR)
-            TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            # выбрать устройства
+            self.bh_index = find_input_device_index(BLACKHOLE_NAME_HINT) or default_input_index()
+            self.mic_index = self.mic_index if self.mic_index is not None else default_input_index()
+            if self.bh_index is None or self.mic_index is None:
+                return {"status": "error", "message": "Аудиоустройства не найдены"}
 
-            self.transcript = ""
-            # старт потоков: запись + транскрибирование
-            self.recording_thread = threading.Thread(target=self._record_audio, daemon=True)
-            self.transcribe_thread = threading.Thread(target=self._transcribe_segments, daemon=True)
-            self.recording_thread.start()
-            self.transcribe_thread.start()
-            self.log_status("Запись началась")
-            return {"status": "success", "message": "Запись началась"}
-        except Exception as e:
-            self.recording = False
-            self.log_status(f"Ошибка начала записи: {e}")
-            return {"status": "error", "message": f"Ошибка начала записи: {e}"}
-
-    def toggle_pause(self) -> dict:
-        if not self.recording:
-            return {"status": "error", "message": "Невозможно поставить на паузу"}
-        if not self.paused:
-            self.paused = True
-            pause_event.set()
-            with self.stream_lock:
-                try:
-                    if self.blackhole_stream:
-                        self.blackhole_stream.stop()
-                    if self.mic_stream:
-                        self.mic_stream.stop()
-                except Exception:
-                    pass
-            self.log_status("Запись на паузе")
-            return {"status": "success", "message": "Запись на паузе"}
-        else:
-            self.paused = False
-            pause_event.clear()
-            with self.stream_lock:
-                try:
-                    if self.blackhole_stream:
-                        self.blackhole_stream.start()
-                    if self.mic_stream:
-                        self.mic_stream.start()
-                except Exception:
-                    pass
-            self.log_status("Запись возобновлена")
-            return {"status": "success", "message": "Запись возобновлена"}
-
-    def stop_recording(self) -> dict:
-        if not self.recording:
-            return {"status": "error", "message": "Запись не идёт"}
-        self.recording = False
-        stop_event.set()
-        self.log_status("Остановка записи...")
-        with self.stream_lock:
+            # sample rate — по blackhole (или дефолт)
             try:
-                if self.blackhole_stream:
-                    self.blackhole_stream.stop()
-                    self.blackhole_stream.close()
-                if self.mic_stream:
-                    self.mic_stream.stop()
-                    self.mic_stream.close()
+                self._sr = int(sd.query_devices(self.bh_index)["default_samplerate"])
+            except Exception:
+                self._sr = SAMPLE_RATE_FALLBACK
+
+            # очистить временные сегменты
+            try:
+                shutil.rmtree(SEG_DIR)
             except Exception:
                 pass
-            finally:
-                self.blackhole_stream = None
-                self.mic_stream = None
+            SEG_DIR.mkdir(exist_ok=True)
 
-        # склеить остатки буферов в финальный WAV (на случай незамкнувшегося сегмента)
-        self._flush_tail_to_queue()
-        self._concat_all_segments_to_wav()
-        return {"status": "success", "message": "Запись остановлена", "wav": Path(OUTPUT_WAV).name}
+            # очистим старые файлы
+            for p in [OUT_WAV, OUT_TXT]:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
-    # ---- аудио-потоки ----
-    def _blackhole_callback(self, indata, frames, time_info, status):
-        if self.recording and not self.paused and not stop_event.is_set():
-            # накопление сегмента
-            self._bh_recording.append((indata.copy() * self.blackhole_gain).astype(np.float32))
-            # PPM-буфер
-            ch = indata[:, 0] if indata.ndim > 1 else indata
-            self.blackhole_buffer.extend(map(float, ch))
-            if len(self.blackhole_buffer) > 4096:
-                self.blackhole_buffer = self.blackhole_buffer[-2048:]
+            self._bh_buf = np.empty((0,), dtype=np.float32)
+            self._mc_buf = np.empty((0,), dtype=np.float32)
+            self._seg_start_ts = time.time()
+            self._seg_count = 0
 
-    def _mic_callback(self, indata, frames, time_info, status):
-        if self.recording and not self.paused and not stop_event.is_set():
-            self._mic_recording.append((indata.copy() * self.mic_gain).astype(np.float32))
-            ch = indata[:, 0] if indata.ndim > 1 else indata
-            self.mic_buffer.extend(map(float, ch))
-            if len(self.mic_buffer) > 4096:
-                self.mic_buffer = self.mic_buffer[-2048:]
+            # запустить входные потоки
+            self._bh_stream = sd.InputStream(
+                device=self.bh_index, channels=1, samplerate=self._sr, callback=self._bh_cb
+            )
+            self._mic_stream = sd.InputStream(
+                device=self.mic_index, channels=1, samplerate=self._sr, callback=self._mic_cb
+            )
+            self._bh_stream.start()
+            self._mic_stream.start()
 
-    def _record_audio(self):
-        # найти BlackHole
-        blackhole_device = None
-        for dev in sd.query_devices():
-            if dev.get('max_input_channels', 0) > 0 and BLACKHOLE_DEVICE in dev['name']:
-                blackhole_device = dev['name']
-                break
-        if not blackhole_device:
-            self.log_status(f"Устройство {BLACKHOLE_DEVICE} не найдено")
-            self.recording = False
+            self.recording = True
+            threading.Thread(target=self._transcriber_loop, daemon=True).start()
+            self.status_message = " "
+            return {"status": "success", "message": "Запись начата"}
+
+    def pause_resume(self) -> Dict:
+        with self._lock:
+            if not self.recording:
+                return {"status": "error", "message": "Запись не идёт"}
+            if not self.paused:
+                self.paused = True
+                pause_event.set()
+                try:
+                    if self._bh_stream:  self._bh_stream.stop()
+                    if self._mic_stream: self._mic_stream.stop()
+                except Exception:
+                    pass
+                return {"status": "success", "message": "Пауза"}
+            else:
+                self.paused = False
+                pause_event.clear()
+                try:
+                    if self._bh_stream:  self._bh_stream.start()
+                    if self._mic_stream: self._mic_stream.start()
+                except Exception:
+                    pass
+                return {"status": "success", "message": "Продолжили"}
+
+    def stop(self) -> Dict:
+        with self._lock:
+            if not self.recording:
+                return {"status": "error", "message": "Запись не идёт"}
             stop_event.set()
-            return
-
-        # инициализация буферов сегмента
-        self._bh_recording: list[np.ndarray] = []
-        self._mic_recording: list[np.ndarray] = []
-        segment_count = 0
-        segment_started_at = time.time()
-
-        # открыть два входных потока
-        try:
-            with self.stream_lock:
-                self.blackhole_stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE, channels=1, device=blackhole_device, callback=self._blackhole_callback
-                )
-                self.mic_stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE, channels=1, device=self.current_mic or None, callback=self._mic_callback
-                )
-                self.blackhole_stream.start()
-                self.mic_stream.start()
-
-            while self.recording and not stop_event.is_set():
-                # раз в 5 секунд резать сегмент
-                if (time.time() - segment_started_at) >= SEGMENT_DURATION and not pause_event.is_set():
-                    if self._bh_recording and self._mic_recording:
-                        bh_seg = np.concatenate(self._bh_recording, axis=0)
-                        mic_seg = np.concatenate(self._mic_recording, axis=0)
-                        min_len = min(len(bh_seg), len(mic_seg))
-                        if min_len > 0:
-                            bh_seg = bh_seg[:min_len]
-                            mic_seg = mic_seg[:min_len]
-
-                            bh_file = str(TEMP_DIR / f"blackhole_segment_{segment_count:04d}.wav")
-                            mic_file = str(TEMP_DIR / f"mic_segment_{segment_count:04d}.wav")
-                            comb_file = str(TEMP_DIR / f"combined_segment_{segment_count:04d}.wav")
-
-                            # комбинированный сегмент для отладки/потребности
-                            comb = (bh_seg + mic_seg) * 0.5
-                            # сохраняем сегменты
-                            wavfile.write(bh_file, SAMPLE_RATE, (bh_seg * 32767.0).astype(np.int16))
-                            wavfile.write(mic_file, SAMPLE_RATE, (mic_seg * 32767.0).astype(np.int16))
-                            wavfile.write(comb_file, SAMPLE_RATE, (comb * 32767.0).astype(np.int16))
-
-                            # отправляем в очередь на транскрибацию
-                            audio_queue.put((bh_file, mic_file, comb_file, segment_started_at))
-                            segment_count += 1
-                            self._bh_recording.clear()
-                            self._mic_recording.clear()
-                            segment_started_at = time.time()
-                            self.log_status(f"Записан сегмент {segment_count}")
-                sd.sleep(50)
-
-            # по завершению добросить хвост в очередь
-            self._flush_tail_to_queue()
-
-        except Exception as e:
-            self.log_status(f"Ошибка записи: {e}")
             self.recording = False
-            stop_event.set()
-
-    def _flush_tail_to_queue(self):
-        if self._bh_recording and self._mic_recording:
-            bh_seg = np.concatenate(self._bh_recording, axis=0)
-            mic_seg = np.concatenate(self._mic_recording, axis=0)
-            min_len = min(len(bh_seg), len(mic_seg))
-            if min_len > 0:
-                bh_seg = bh_seg[:min_len]
-                mic_seg = mic_seg[:min_len]
-                idx = len(list(TEMP_DIR.glob("blackhole_segment_*.wav")))
-                bh_file = str(TEMP_DIR / f"blackhole_segment_{idx:04d}.wav")
-                mic_file = str(TEMP_DIR / f"mic_segment_{idx:04d}.wav")
-                comb_file = str(TEMP_DIR / f"combined_segment_{idx:04d}.wav")
-                comb = (bh_seg + mic_seg) * 0.5
-                wavfile.write(bh_file, SAMPLE_RATE, (bh_seg * 32767.0).astype(np.int16))
-                wavfile.write(mic_file, SAMPLE_RATE, (mic_seg * 32767.0).astype(np.int16))
-                wavfile.write(comb_file, SAMPLE_RATE, (comb * 32767.0).astype(np.int16))
-                audio_queue.put((bh_file, mic_file, comb_file, time.time()))
-            self._bh_recording.clear()
-            self._mic_recording.clear()
-
-    def _concat_all_segments_to_wav(self):
-        segs = sorted(TEMP_DIR.glob("combined_segment_*.wav"))
-        if not segs:
-            return
-        # склеим в финальный WAV
-        data_all: list[np.ndarray] = []
-        for p in segs:
-            _, data = wavfile.read(str(p))
-            # нормализуем к float32
-            if data.dtype != np.int16:
-                data = data.astype(np.int16)
-            data_all.append(data.astype(np.float32) / 32767.0)
-        if data_all:
-            full = np.concatenate(data_all, axis=0)
-            wavfile.write(OUTPUT_WAV, SAMPLE_RATE, (full * 32767.0).astype(np.int16))
-            self.log_status(f"WAV сохранён: {OUTPUT_WAV}")
-
-    # ---- транскрибация ----
-    def _transcribe_segments(self):
-        self.log_status("Загрузка модели GigaAM v2 RNNT...")
-        model = gigaam.load_model("v2_rnnt")
-        try:
-            with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
-                while self.recording or not audio_queue.empty():
-                    try:
-                        bh_file, mic_file, comb_file, seg_t = audio_queue.get(timeout=1.0)
-                    except queue.Empty:
-                        time.sleep(0.25)
-                        continue
-
-                    try:
-                        self.log_status(f"Транскрибируется сегмент: {Path(bh_file).name}")
-
-                        bh_text = ""
-                        if os.path.getsize(bh_file) > 0:
-                            _, bh_data = wavfile.read(bh_file)
-                            if not self.is_silent(bh_data, self.blackhole_silence_threshold):
-                                bh_text = model.transcribe(bh_file).strip()
-                                if bh_text and bh_text != "Продолжение следует...":
-                                    line = f"Собеседник: {bh_text}\n"
-                                    transcript_queue.put(line)
-                                    f.write(line)
-
-                        mic_text = ""
-                        if os.path.getsize(mic_file) > 0:
-                            _, mc_data = wavfile.read(mic_file)
-                            if not self.is_silent(mc_data, self.mic_silence_threshold):
-                                mic_text = model.transcribe(mic_file).strip()
-                                if mic_text and mic_text != "Продолжение следует...":
-                                    line = f"Вы: {mic_text}\n"
-                                    transcript_queue.put(line)
-                                    f.write(line)
-
-                        f.flush()
-                    finally:
-                        audio_queue.task_done()
-            self.log_status("Транскрибация завершена")
-        except Exception as e:
-            self.log_status(f"Ошибка транскрипции: {e}")
-
-    # ---- работа с текстом ----
-    def get_transcript(self) -> str:
-        """
-        Возвращает инкремент с момента прошлого запроса (для «реального времени» через polling).
-        """
-        collected = []
-        while not transcript_queue.empty():
+            self.paused = False
+            # добросим хвост сегмента
+            self._flush_tail_segment()
             try:
-                collected.append(transcript_queue.get_nowait())
-                transcript_queue.task_done()
-            except queue.Empty:
-                break
-        if collected:
-            piece = "".join(collected)
-            self.transcript += piece
-            return piece
-        return ""
+                if self._bh_stream:  self._bh_stream.stop(); self._bh_stream.close()
+                if self._mic_stream: self._mic_stream.stop(); self._mic_stream.close()
+            finally:
+                self._bh_stream = None
+                self._mic_stream = None
+            # склеим общий WAV
+            self._concat_segments()
+            return {"status": "success", "message": "Остановлено", "wav": OUT_WAV.name}
 
-    def save_transcript(self) -> dict:
-        if not self.transcript:
-            self.log_status("Транскрипт пуст!")
-            return {"status": "error", "message": "Транскрипт пуст!"}
-        with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
-            f.write(self.transcript)
-        self.log_status("Транскрипт сохранен")
-        return {"status": "success", "message": "Транскрипт сохранен"}
+    # ---- коллбэки ----
+    def _bh_cb(self, indata, frames, time_info, status):
+        if not self.recording or self.paused or stop_event.is_set():
+            return
+        mono = indata[:, 0] if indata.ndim > 1 else indata
+        mono = np.array(mono, dtype=np.float32)
+        self._bh_buf = np.concatenate([self._bh_buf, mono])
+        # PPM окно
+        self._ppm_bh_ring.extend(mono.tolist())
+        if len(self._ppm_bh_ring) > 4096:
+            self._ppm_bh_ring = self._ppm_bh_ring[-2048:]
 
-    def summarize_transcript(self) -> dict:
-        if self.recording or self.paused:
-            return {"status": "error", "message": "Нельзя пересказать во время записи"}
-        if not self.transcript:
-            return {"status": "error", "message": "Транскрипт пуст для пересказа"}
+    def _mic_cb(self, indata, frames, time_info, status):
+        if not self.recording or self.paused or stop_event.is_set():
+            return
+        mono = indata[:, 0] if indata.ndim > 1 else indata
+        mono = np.array(mono, dtype=np.float32)
+        self._mc_buf = np.concatenate([self._mc_buf, mono])
+        # PPM окно
+        self._ppm_mc_ring.extend(mono.tolist())
+        if len(self._ppm_mc_ring) > 4096:
+            self._ppm_mc_ring = self._ppm_mc_ring[-2048:]
+
+        # проверяем, не пора ли резать сегмент (привязываемся к микрофонному коллбэку)
+        if (time.time() - self._seg_start_ts) >= SEGMENT_SEC:
+            self._cut_segment()
+
+    # ---- сегментация / ppm / конкатенация ----
+    def _cut_segment(self):
+        # выравниваем длины
+        n = min(self._bh_buf.size, self._mc_buf.size)
+        if n <= 0:
+            self._seg_start_ts = time.time()
+            return
+        bh = self._bh_buf[:n]
+        mc = self._mc_buf[:n]
+        # обнулим использованные части
+        self._bh_buf = self._bh_buf[n:]
+        self._mc_buf = self._mc_buf[n:]
+
+        idx = self._seg_count
+        self._seg_count += 1
+
+        bh_file = SEG_DIR / f"blackhole_segment_{idx:04d}.wav"
+        mc_file = SEG_DIR / f"mic_segment_{idx:04d}.wav"
+        mix_file = SEG_DIR / f"combined_segment_{idx:04d}.wav"
+
+        # нормализованный микс для мониторинга/сохранения итогового wav
+        mix = bh + mc
+        max_abs = np.max(np.abs(mix)) if mix.size else 1.0
+        if max_abs > 1.0:
+            mix = mix / max_abs
+
+        wavfile.write(str(bh_file), self._sr, (bh * 32767).astype(np.int16))
+        wavfile.write(str(mc_file), self._sr, (mc * 32767).astype(np.int16))
+        wavfile.write(str(mix_file), self._sr, (mix * 32767).astype(np.int16))
+
+        seg_queue.put(mix_file)   # транскрибируем общий сегмент
+        self._seg_start_ts = time.time()
+
+    def _flush_tail_segment(self):
+        n = min(self._bh_buf.size, self._mc_buf.size)
+        if n <= 0:
+            return
+        bh = self._bh_buf[:n]; mc = self._mc_buf[:n]
+        idx = self._seg_count
+        self._seg_count += 1
+        bh_file = SEG_DIR / f"blackhole_segment_{idx:04d}.wav"
+        mc_file = SEG_DIR / f"mic_segment_{idx:04d}.wav"
+        mix_file = SEG_DIR / f"combined_segment_{idx:04d}.wav"
+        mix = bh + mc
+        max_abs = np.max(np.abs(mix)) if mix.size else 1.0
+        if max_abs > 1.0:
+            mix = mix / max_abs
+        wavfile.write(str(bh_file), self._sr, (bh * 32767).astype(np.int16))
+        wavfile.write(str(mc_file), self._sr, (mc * 32767).astype(np.int16))
+        wavfile.write(str(mix_file), self._sr, (mix * 32767).astype(np.int16))
+        seg_queue.put(mix_file)
+        self._bh_buf = np.empty((0,), dtype=np.float32)
+        self._mc_buf = np.empty((0,), dtype=np.float32)
+
+    def _concat_segments(self):
+        files = sorted(SEG_DIR.glob("combined_segment_*.wav"))
+        if not files:
+            return
+        data = []
+        for p in files:
+            sr, x = wavfile.read(str(p))
+            if x.dtype != np.int16:
+                x = x.astype(np.int16)
+            data.append(x.astype(np.float32) / 32767.0)
+        full = np.concatenate(data, axis=0) if data else np.empty((0,), dtype=np.float32)
+        wavfile.write(str(OUT_WAV), self._sr, (full * 32767).astype(np.int16))
+
+    def ppm_snapshot(self) -> Dict[str, float]:
+        """Мгновенный уровень для polling."""
+        if self._ppm_bh_ring:
+            arr = np.array(self._ppm_bh_ring[-1024:], dtype=np.float64)
+            self._ppm_bh = db_from_rms(float(np.sqrt(np.mean(arr * arr))))
+        if self._ppm_mc_ring:
+            arr = np.array(self._ppm_mc_ring[-1024:], dtype=np.float64)
+            self._ppm_mc = db_from_rms(float(np.sqrt(np.mean(arr * arr))))
+        return {"mic_db": self._ppm_mc, "blackhole_db": self._ppm_bh}
+
+    # ---- транскрипция (фоновый луп) ----
+    def _transcriber_loop(self):
+        with open(OUT_TXT, "w", encoding="utf-8") as f:
+            while not stop_event.is_set() or not seg_queue.empty():
+                try:
+                    seg = seg_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    txt = ASR.transcribe(seg)
+                    if txt:
+                        # «в реальном времени» — отправим инкремент
+                        line = txt.strip()
+                        transcript_q.put(line + "\n")
+                        f.write(line + "\n")
+                        f.flush()
+                finally:
+                    seg_queue.task_done()
+
+REC = Recorder()
+
+# ---------- SSE генераторы ----------
+def sse_pack(obj: Dict) -> bytes:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
+
+def sse_levels() -> Generator[bytes, None, None]:
+    """10 Гц обновление уровней."""
+    while True:
+        yield sse_pack(REC.ppm_snapshot())
+        time.sleep(0.1)
+
+def sse_transcript() -> Generator[bytes, None, None]:
+    """Пушим появляющиеся строки транскрипции."""
+    while True:
         try:
-            response = self.gigachat.chat(f"Перескажи следующий диалог: {self.transcript}")
-            self.summary = response.choices[0].message.content
-            return {"status": "success", "message": "Саммари готово", "summary": self.summary}
-        except Exception as e:
-            return {"status": "error", "message": f"Ошибка пересказа: {e}"}
+            line = transcript_q.get(timeout=0.1)
+            yield sse_pack({"text": line})
+        except queue.Empty:
+            # поддерживаем соединение
+            yield b": keepalive\n\n"
+            time.sleep(0.4)
 
-
-recorder = AudioRecorder()
-
-
-# -----------------------------
-# РОУТЫ (имена как в исходнике)
-# -----------------------------
-
-@app.route('/')
-def index():
-    # desktop.py отдаёт index.html из билд-папки; этот маршрут нужен, если запустят напрямую main.py
+# ---------- API/ALIases ----------
+@app.route("/")
+def _index():
     idx = STATIC_DIR / "index.html"
     if idx.exists():
-        return send_from_directory(str(STATIC_DIR), 'index.html')
-    abort(404)
+        return send_from_directory(str(STATIC_DIR), "index.html")
+    return "Build not found", 404
 
-@app.route('/api/microphones', methods=['GET'])
-def get_microphones():
-    return jsonify({"microphones": recorder.get_available_microphones(), "current_mic": recorder.current_mic})
+# устройства
+@app.route("/api/microphones", methods=["GET"])
+@app.route("/microphones", methods=["GET"])
+def api_mics():
+    cur = device_name_by_index(REC.mic_index)
+    return jsonify({"microphones": [d["name"] for d in REC.devices()], "current_mic": cur})
 
-@app.route('/api/switch_microphone/<mic_name>', methods=['POST'])
-def switch_microphone(mic_name):
-    return jsonify(recorder.switch_microphone(mic_name))
+@app.route("/api/switch_microphone/<path:name>", methods=["POST"])
+@app.route("/switch_microphone/<path:name>", methods=["POST"])
+def api_switch_mic(name: str):
+    return jsonify(REC.set_mic_by_name(name))
 
-@app.route('/api/update_mic_gain/<float:value>', methods=['POST'])
-def update_mic_gain(value: float):
-    recorder.mic_gain = float(value)
-    return jsonify({"status": "success", "message": f"Усиление микрофона установлено: {value}"})
+@app.route("/api/microphone", methods=["PUT", "POST"])
+def api_switch_mic_json():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name") or data.get("mic") or ""
+    return jsonify(REC.set_mic_by_name(name))
 
-@app.route('/api/update_blackhole_gain/<float:value>', methods=['POST'])
-def update_blackhole_gain(value: float):
-    recorder.blackhole_gain = float(value)
-    return jsonify({"status": "success", "message": f"Усиление BlackHole установлено: {value}"})
+# запись
+@app.route("/api/record/start", methods=["POST"])
+@app.route("/start_recording", methods=["POST"])
+@app.route("/api/toggle_recording", methods=["POST"])
+def api_start():
+    return jsonify(REC.start())
 
-@app.route('/api/update_mic_gate/<float:value>', methods=['POST'])
-def update_mic_gate(value: float):
-    recorder.mic_silence_threshold = float(value)
-    return jsonify({"status": "success", "message": f"Порог тишины микрофона: {value}"})
+@app.route("/api/record/pause", methods=["POST"])
+@app.route("/api/toggle_pause", methods=["POST"])
+def api_pause():
+    return jsonify(REC.pause_resume())
 
-@app.route('/api/update_blackhole_gate/<float:value>', methods=['POST'])
-def update_blackhole_gate(value: float):
-    recorder.blackhole_silence_threshold = float(value)
-    return jsonify({"status": "success", "message": f"Порог тишины BlackHole: {value}"})
+@app.route("/api/record/stop", methods=["POST"])
+@app.route("/stop_recording", methods=["POST"])
+def api_stop():
+    return jsonify(REC.stop())
 
-@app.route('/api/levels', methods=['GET'])
-def get_levels():
-    recorder.update_levels()
-    return jsonify({
-        "mic_level": recorder.mic_level_val,
-        "blackhole_level": recorder.blackhole_level_val
-    })
+# уровни
+@app.route("/api/levels", methods=["GET"])
+@app.route("/levels", methods=["GET"])
+def api_levels():
+    return jsonify(REC.ppm_snapshot())
 
-@app.route('/api/toggle_recording', methods=['POST'])
-def toggle_recording():
-    return jsonify(recorder.toggle_recording())
+@app.route("/api/levels/stream")
+@app.route("/levels/stream")
+def api_levels_stream():
+    return Response(sse_levels(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
 
-@app.route('/api/toggle_pause', methods=['POST'])
-def toggle_pause():
-    return jsonify(recorder.toggle_pause())
+# транскрипт
+@app.route("/api/transcript", methods=["GET"])
+@app.route("/transcript", methods=["GET"])
+def api_transcript():
+    lines = []
+    while not transcript_q.empty():
+        try:
+            lines.append(transcript_q.get_nowait())
+            transcript_q.task_done()
+        except queue.Empty:
+            break
+    return jsonify({"transcript": "".join(lines)})
 
-@app.route('/api/stop_recording', methods=['POST'])
-def stop_recording():
-    return jsonify(recorder.stop_recording())
+@app.route("/api/transcript/stream")
+@app.route("/transcript/stream")
+def api_transcript_stream():
+    return Response(sse_transcript(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
 
-@app.route('/api/transcript', methods=['GET'])
-def get_transcript():
-    # возвращает только инкремент с прошлого запроса (для «реального времени»)
-    return jsonify({"transcript": recorder.get_transcript()})
+# файлы
+@app.route("/api/files", methods=["GET"])
+def api_files():
+    items = []
+    for p in DATA_DIR.glob("*"):
+        if p.is_file():
+            items.append({
+                "name": p.name,
+                "size": p.stat().st_size,
+                "mtime": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+                "ext": p.suffix.lower(),
+            })
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return jsonify(items=items)
 
-@app.route('/api/save_transcript', methods=['POST'])
-def save_transcript():
-    return jsonify(recorder.save_transcript())
+@app.route("/api/download/<path:filename>", methods=["GET"])
+def api_download(filename: str):
+    safe = (DATA_DIR / filename).resolve()
+    if not str(safe).startswith(str(DATA_DIR.resolve())):
+        abort(403)
+    if not safe.exists():
+        abort(404)
+    return send_from_directory(DATA_DIR, filename, as_attachment=True)
 
-@app.route('/api/summarize', methods=['POST'])
-def summarize():
-    return jsonify(recorder.summarize_transcript())
+# статус (без «шаблонной фразы»)
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    return jsonify({"status": REC.status_message or ""})
 
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    # пустая строка при старте — убрал шаблонную фразу
-    return jsonify({"status": recorder.status_message})
-
-
-# Прямой запуск (для отладки без desktop.py)
+# локальный запуск
 if __name__ == "__main__":
-    # слушаем только loopback
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
