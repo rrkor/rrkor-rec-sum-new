@@ -1,3 +1,5 @@
 .DS_Store
 /.env
 /rrkor-front/
+/transcript.txt
+/meeting_audio.wav

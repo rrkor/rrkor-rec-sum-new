@@ -41,7 +41,8 @@ def start_backend() -> subprocess.Popen:
     # запускаем ваш FastAPI (main.py содержит uvicorn.run("main:app", ...))
     env = os.environ.copy()
     cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", BACKEND_HOST, "--port", BACKEND_PORT]
-    return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Убираем stdout=subprocess.PIPE чтобы видеть логи в реальном времени
+    return subprocess.Popen(cmd, env=env)
 
 def main():
     # 1) поднимаем бэкенд, если не запущен
@@ -63,14 +64,14 @@ def main():
 
     # 2) окно с QWebEngineView
     app = QApplication(sys.argv)
-    app.setApplicationName("Recorder & Summarizer")
-    app.setOrganizationName("rrkor")
+    app.setApplicationName("Rec&Sum")
+    app.setOrganizationName("RRKOR™")
     icon_path = Path(__file__).with_name("app.png")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
     view = QWebEngineView()
-    view.setWindowTitle("Recorder & Summarizer")
+    view.setWindowTitle("Rec&Sum")
     view.resize(1280, 800)
 
     # правильная настройка атрибутов через класс QWebEngineSettings

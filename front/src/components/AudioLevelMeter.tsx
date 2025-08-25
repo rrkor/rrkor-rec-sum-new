@@ -11,6 +11,9 @@ export const AudioLevelMeter = ({ level, className }: AudioLevelMeterProps) => {
   const normalizedLevel = Math.max(-60, Math.min(0, level));
   const percentage = Math.max(0, Math.min(100, ((normalizedLevel + 60) / 60) * 100));
   
+  // Логируем для отладки
+  console.log('AudioLevelMeter: Rendering with level:', level, 'dB, percentage:', percentage);
+  
   // Более чувствительная цветовая схема для PPM
   const getColor = () => {
     if (percentage <= 30) return 'bg-audio-green';      // Зеленый до -42 dB

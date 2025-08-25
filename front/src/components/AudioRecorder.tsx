@@ -85,6 +85,9 @@ const AudioRecorder = () => {
     };
 
     const handleLevelsMessage = (message: LevelsMessage) => {
+      console.log('AudioRecorder: Levels message received:', message);
+      console.log('AudioRecorder: Setting mic level from', micLevel, 'to', message.mic_db);
+      console.log('AudioRecorder: Setting blackhole level from', blackholeLevel, 'to', message.blackhole_db);
       setMicLevel(message.mic_db);
       setBlackholeLevel(message.blackhole_db);
     };
