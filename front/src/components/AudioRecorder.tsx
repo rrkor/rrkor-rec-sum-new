@@ -1,4 +1,4 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useState, useRef} from 'react';
 import {Card, CardContent, CardHeader, CardTitle} from './ui/card';
 import {Button} from './ui/button';
 import {Badge} from './ui/badge';
@@ -10,10 +10,27 @@ import {Clock, Copy, Mic, Pause, Play, Save, Settings, Sparkles, Square} from 'l
 import {AudioLevelMeter} from './AudioLevelMeter';
 import {cn} from '../lib/utils';
 import audioLogo from '../assets/audio-logo.png';
+import {useApi} from '../hooks/useApi';
+import {TranscriptMessage, LevelsMessage} from '../lib/websocket';
 
 type RecordingState = 'idle' | 'recording' | 'paused';
 
 const AudioRecorder = () => {
+  const {
+    devices,
+    state,
+    transcript: transcriptQuery,
+    selectMicrophone,
+    startRecording,
+    pauseRecording,
+    resumeRecording,
+    stopRecording,
+    updateSettings,
+    saveTranscript,
+    summarize,
+    setupWebSocket,
+  } = useApi();
+
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [micLevel, setMicLevel] = useState(-60);
   const [blackholeLevel, setBlackholeLevel] = useState(-60);
@@ -21,37 +38,81 @@ const AudioRecorder = () => {
   const [blackholeGain, setBlackholeGain] = useState([1.0]);
   const [micThreshold, setMicThreshold] = useState([0.01]);
   const [blackholeThreshold, setBlackholeThreshold] = useState([0.01]);
-  const [selectedMic, setSelectedMic] = useState("MacBook Pro Microphone");
-  const [transcript, setTranscript] = useState("Собеседник: Привет! Как дела?\nВы: Отлично, спасибо! А у вас?\nСобеседник: Тоже хорошо. Давайте обсудим проект...\nСобеседник: У нас есть несколько интересных идей для реализации\nВы: Звучит замечательно! Расскажите подробнее\nСобеседник: Мы хотим создать современный интерфейс с использованием новых технологий");
+  const [selectedMic, setSelectedMic] = useState("");
+  const [transcript, setTranscript] = useState("");
   const [summary, setSummary] = useState("");
   const [recordingTime, setRecordingTime] = useState(0);
+  const recordingStartTime = useRef<number>(0);
 
-  // Simulate audio levels when recording
+  // Sync with backend state
   useEffect(() => {
-    if (recordingState === 'recording') {
-      const interval = setInterval(() => {
-        // Simulate realistic audio levels
-        setMicLevel(-60 + Math.random() * 50 + Math.sin(Date.now() / 1000) * 10);
-        setBlackholeLevel(-60 + Math.random() * 40 + Math.cos(Date.now() / 800) * 8);
-      }, 100);
-      
-      return () => clearInterval(interval);
-    } else {
-      setMicLevel(-60);
-      setBlackholeLevel(-60);
+    if (state.data) {
+      const backendState = state.data;
+      setRecordingState(backendState.recording ? (backendState.paused ? 'paused' : 'recording') : 'idle');
+      // Обновляем уровни из state.data как fallback, если WebSocket не работает
+      if (micLevel === -60) {
+        setMicLevel(backendState.mic_db);
+      }
+      if (blackholeLevel === -60) {
+        setBlackholeLevel(backendState.blackhole_db);
+      }
+      setMicGain([backendState.mic_gain]);
+      setBlackholeGain([backendState.blackhole_gain]);
+      setMicThreshold([backendState.mic_silence_threshold]);
+      setBlackholeThreshold([backendState.blackhole_silence_threshold]);
+      setSelectedMic(backendState.selected_mic);
     }
-  }, [recordingState]);
+  }, [state.data, micLevel, blackholeLevel]);
+
+  // Sync transcript from backend
+  useEffect(() => {
+    if (transcriptQuery.data) {
+      setTranscript(transcriptQuery.data.text);
+    }
+  }, [transcriptQuery.data]);
+
+  // Sync selected microphone from devices
+  useEffect(() => {
+    if (devices.data && devices.data.selected) {
+      setSelectedMic(devices.data.selected);
+    }
+  }, [devices.data]);
+
+  // WebSocket setup for real-time updates
+  useEffect(() => {
+    const handleTranscriptMessage = (message: TranscriptMessage) => {
+      setTranscript(prev => prev + message.text);
+    };
+
+    const handleLevelsMessage = (message: LevelsMessage) => {
+      setMicLevel(message.mic_db);
+      setBlackholeLevel(message.blackhole_db);
+    };
+
+    // Подключаем WebSocket только один раз при монтировании компонента
+    const wsClient = setupWebSocket(handleTranscriptMessage, handleLevelsMessage);
+    
+    // Очистка при размонтировании
+    return () => {
+      if (wsClient) {
+        wsClient.disconnect();
+      }
+    };
+  }, []); // Убираем setupWebSocket из зависимостей
 
   // Recording timer
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (recordingState === 'recording') {
+      if (recordingStartTime.current === 0) {
+        recordingStartTime.current = Date.now();
+      }
       interval = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
+        const elapsed = Math.floor((Date.now() - recordingStartTime.current) / 1000);
+        setRecordingTime(elapsed);
       }, 1000);
-    }
-    
-    if (recordingState === 'idle') {
+    } else {
+      recordingStartTime.current = 0;
       setRecordingTime(0);
     }
     
@@ -66,31 +127,84 @@ const AudioRecorder = () => {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const mockMicrophones = [
-    "MacBook Pro Microphone",
-    "USB Headset",
-    "Blue Yeti",
-    "External Audio Interface"
-  ];
-
-  const toggleRecording = () => {
-    if (recordingState === 'idle') {
-      setRecordingState('recording');
-    } else if (recordingState === 'recording') {
-      setRecordingState('paused');
-    } else {
-      setRecordingState('recording');
+  const toggleRecording = async () => {
+    try {
+      if (recordingState === 'idle') {
+        await startRecording.mutateAsync();
+      } else if (recordingState === 'recording') {
+        await pauseRecording.mutateAsync();
+      } else {
+        await resumeRecording.mutateAsync();
+      }
+    } catch (error) {
+      console.error('Recording toggle error:', error);
     }
   };
 
-  const stopRecording = () => {
-    setRecordingState('idle');
+  const stopRecordingHandler = async () => {
+    try {
+      await stopRecording.mutateAsync();
+    } catch (error) {
+      console.error('Stop recording error:', error);
+    }
   };
 
-  const handleSummarize = () => {
+  const handleMicrophoneChange = async (micName: string) => {
+    try {
+      await selectMicrophone.mutateAsync(micName);
+    } catch (error) {
+      console.error('Microphone change error:', error);
+    }
+  };
+
+  const handleGainChange = async (type: 'mic' | 'blackhole', value: number[]) => {
+    try {
+      const settings: any = {};
+      if (type === 'mic') {
+        settings.mic_gain = value[0];
+        setMicGain(value);
+      } else {
+        settings.blackhole_gain = value[0];
+        setBlackholeGain(value);
+      }
+      await updateSettings.mutateAsync(settings);
+    } catch (error) {
+      console.error('Gain change error:', error);
+    }
+  };
+
+  const handleThresholdChange = async (type: 'mic' | 'blackhole', value: number[]) => {
+    try {
+      const settings: any = {};
+      if (type === 'mic') {
+        settings.mic_silence_threshold = value[0];
+        setMicThreshold(value);
+      } else {
+        settings.blackhole_silence_threshold = value[0];
+        setBlackholeThreshold(value);
+      }
+      await updateSettings.mutateAsync(settings);
+    } catch (error) {
+      console.error('Threshold change error:', error);
+    }
+  };
+
+  const handleSaveTranscript = async () => {
+    try {
+      await saveTranscript.mutateAsync();
+    } catch (error) {
+      console.error('Save transcript error:', error);
+    }
+  };
+
+  const handleSummarize = async () => {
     if (transcript.trim()) {
-      // Simulate AI summarization
-      setSummary("Краткое содержание разговора:\n\nВ ходе беседы обсуждались планы по реализации проекта с использованием современных технологий. Собеседники выразили заинтересованность в создании инновационного интерфейса и готовность к дальнейшему сотрудничеству.\n\nКлючевые моменты:\n• Обсуждение новых идей\n• Планирование технической реализации\n• Положительная реакция на предложения");
+      try {
+        const result = await summarize.mutateAsync(transcript);
+        setSummary(result.summary);
+      } catch (error) {
+        console.error('Summarize error:', error);
+      }
     }
   };
 
@@ -169,12 +283,16 @@ const AudioRecorder = () => {
                   <label className="text-sm font-medium text-muted-foreground mb-2 block">
                     Источник
                   </label>
-                  <Select value={selectedMic} onValueChange={setSelectedMic}>
+                  <Select 
+                    value={selectedMic} 
+                    onValueChange={handleMicrophoneChange}
+                    disabled={devices.isLoading || selectMicrophone.isPending}
+                  >
                     <SelectTrigger className="bg-input border-border">
-                      <SelectValue />
+                      <SelectValue placeholder={devices.isLoading ? "Загрузка..." : "Выберите микрофон"} />
                     </SelectTrigger>
                     <SelectContent>
-                      {mockMicrophones.map((mic) => (
+                      {devices.data?.microphones.map((mic) => (
                         <SelectItem key={mic} value={mic}>
                           {mic}
                         </SelectItem>
@@ -203,11 +321,12 @@ const AudioRecorder = () => {
                     </label>
                     <Slider
                       value={micGain}
-                      onValueChange={setMicGain}
+                      onValueChange={(value) => handleGainChange('mic', value)}
                       min={0}
                       max={2}
                       step={0.1}
                       className="w-full"
+                      disabled={updateSettings.isPending}
                     />
                   </div>
                   
@@ -217,11 +336,12 @@ const AudioRecorder = () => {
                     </label>
                     <Slider
                       value={micThreshold}
-                      onValueChange={setMicThreshold}
+                      onValueChange={(value) => handleThresholdChange('mic', value)}
                       min={0}
                       max={0.1}
                       step={0.001}
                       className="w-full"
+                      disabled={updateSettings.isPending}
                     />
                   </div>
                 </div>
@@ -246,11 +366,12 @@ const AudioRecorder = () => {
                     </label>
                     <Slider
                       value={blackholeGain}
-                      onValueChange={setBlackholeGain}
+                      onValueChange={(value) => handleGainChange('blackhole', value)}
                       min={0}
                       max={2}
                       step={0.1}
                       className="w-full"
+                      disabled={updateSettings.isPending}
                     />
                   </div>
                   
@@ -260,11 +381,12 @@ const AudioRecorder = () => {
                     </label>
                     <Slider
                       value={blackholeThreshold}
-                      onValueChange={setBlackholeThreshold}
+                      onValueChange={(value) => handleThresholdChange('blackhole', value)}
                       min={0}
                       max={0.1}
                       step={0.001}
                       className="w-full"
+                      disabled={updateSettings.isPending}
                     />
                   </div>
                 </div>
@@ -279,6 +401,7 @@ const AudioRecorder = () => {
                     onClick={toggleRecording}
                     variant={recordingState === 'recording' ? 'pause' : 'audio'}
                     className="flex-1 min-w-[100px]"
+                    disabled={startRecording.isPending || pauseRecording.isPending || resumeRecording.isPending}
                   >
                     {recordingState === 'recording' ? (
                       <><Pause className="w-4 h-4 mr-2" />Пауза</>
@@ -289,9 +412,9 @@ const AudioRecorder = () => {
                   </Button>
                   
                   <Button
-                    onClick={stopRecording}
+                    onClick={stopRecordingHandler}
                     variant="destructive"
-                    disabled={recordingState === 'idle'}
+                    disabled={recordingState === 'idle' || stopRecording.isPending}
                     className="flex-1 min-w-[100px]"
                   >
                     <Square className="w-4 h-4 mr-2" />
@@ -302,11 +425,23 @@ const AudioRecorder = () => {
                 <Separator className="my-4" />
                 
                 <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" size="sm" className="flex-1">
+                  <Button 
+                    variant="outline" 
+                    size="sm" 
+                    className="flex-1"
+                    onClick={handleSaveTranscript}
+                    disabled={saveTranscript.isPending || !transcript.trim()}
+                  >
                     <Save className="w-4 h-4 mr-2" />
                     Сохранить
                   </Button>
-                  <Button variant="outline" size="sm" className="flex-1">
+                  <Button 
+                    variant="outline" 
+                    size="sm" 
+                    className="flex-1"
+                    onClick={() => navigator.clipboard.writeText(transcript)}
+                    disabled={!transcript.trim()}
+                  >
                     <Copy className="w-4 h-4 mr-2" />
                     Копировать
                   </Button>
@@ -345,10 +480,10 @@ const AudioRecorder = () => {
                       size="sm"
                       onClick={handleSummarize}
                       className="bg-gradient-accent hover:bg-accent/80"
-                      disabled={!transcript.trim() || recordingState !== 'idle'}
+                      disabled={!transcript.trim() || recordingState !== 'idle' || summarize.isPending}
                     >
                       <Sparkles className="w-4 h-4 mr-2" />
-                      Создать
+                      {summarize.isPending ? 'Создание...' : 'Создать'}
                     </Button>
                   </CardTitle>
                 </CardHeader>

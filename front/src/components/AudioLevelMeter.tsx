@@ -7,18 +7,22 @@ interface AudioLevelMeterProps {
 
 export const AudioLevelMeter = ({ level, className }: AudioLevelMeterProps) => {
   // Convert dB level (-60 to 0) to percentage (0 to 100)
-  const percentage = Math.max(0, Math.min(100, ((level + 60) / 60) * 100));
+  // Используем нелинейную шкалу для лучшей чувствительности к низким уровням
+  const normalizedLevel = Math.max(-60, Math.min(0, level));
+  const percentage = Math.max(0, Math.min(100, ((normalizedLevel + 60) / 60) * 100));
   
-  // Determine color based on level
+  // Более чувствительная цветовая схема для PPM
   const getColor = () => {
-    if (percentage <= 70) return 'bg-audio-green';
-    if (percentage <= 90) return 'bg-audio-yellow';
-    return 'bg-audio-red';
+    if (percentage <= 30) return 'bg-audio-green';      // Зеленый до -42 dB
+    if (percentage <= 60) return 'bg-audio-yellow';    // Желтый до -24 dB  
+    if (percentage <= 85) return 'bg-audio-orange';    // Оранжевый до -9 dB
+    return 'bg-audio-red';                             // Красный выше -9 dB
   };
 
   const getGradientColor = () => {
-    if (percentage <= 70) return 'from-audio-green/20 to-audio-green';
-    if (percentage <= 90) return 'from-audio-yellow/20 to-audio-yellow';
+    if (percentage <= 30) return 'from-audio-green/20 to-audio-green';
+    if (percentage <= 60) return 'from-audio-yellow/20 to-audio-yellow';
+    if (percentage <= 85) return 'from-orange-400/20 to-orange-500';
     return 'from-audio-red/20 to-audio-red';
   };
 
@@ -52,9 +56,9 @@ export const AudioLevelMeter = ({ level, className }: AudioLevelMeterProps) => {
       {/* dB Scale */}
       <div className="flex justify-between text-xs text-muted-foreground mt-1">
         <span>-60</span>
-        <span>-30</span>
-        <span>-12</span>
-        <span>-6</span>
+        <span>-42</span>
+        <span>-24</span>
+        <span>-9</span>
         <span>0</span>
       </div>
       
