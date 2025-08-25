@@ -56,8 +56,8 @@ def db_from_buffer(buf: list[float], current_db: float = -60.0, smoothing: float
     if not buf:
         return current_db
     
-    # Берем только последние 512 сэмплов для быстрого обновления PPM
-    arr = np.array(buf[-512:], dtype=np.float64)
+    # Берем только последние 256 сэмплов для быстрого обновления PPM
+    arr = np.array(buf[-256:], dtype=np.float64)
     
     # Используем пиковые значения для PPM (как в Google Meet/Discord)
     peak = np.max(np.abs(arr))
@@ -91,8 +91,8 @@ def db_from_buffer(buf: list[float], current_db: float = -60.0, smoothing: float
     # smoothing = 0.4 означает быстрый отклик (60% нового значения, 40% старого)
     smoothed_db = current_db * (1 - smoothing) + new_db * smoothing
     
-    # Логируем для отладки PPM
-    if len(buf) > 0 and int(time.time()) % 5 == 0: # каждые 5 секунд для лучшей отладки
+    # Логируем для отладки PPM (уменьшаем частоту)
+    if len(buf) > 0 and int(time.time()) % 15 == 0: # каждые 15 секунд для лучшей отладки
         logger.info(f"PPM Debug: buffer_len={len(buf)}, peak={peak:.6f}, new_db={new_db:.1f}, smoothed_db={smoothed_db:.1f}, current_db={current_db:.1f}")
     
     return float(smoothed_db)
@@ -235,6 +235,51 @@ def ws_broadcast_levels(mic_db: float, blackhole_db: float):
     for ws in dead:
         STATE.ws_levels_clients.discard(ws)
 
+# ================== CALLBACK ФУНКЦИИ ==================
+def blackhole_callback(indata, frames, time_info, status):
+    try:
+        # Всегда обновляем буфер для уровней - быстро и без блокировок
+        last = indata[:, 0] if indata.ndim > 1 else indata
+        STATE.blackhole_buffer.extend(last.tolist())
+        
+        # Ограничиваем размер буфера для быстрого обновления PPM
+        if len(STATE.blackhole_buffer) > 512:
+            STATE.blackhole_buffer = STATE.blackhole_buffer[-256:]
+        
+        # Логируем для отладки каждые 5 секунд (уменьшаем частоту)
+        if int(time.time()) % 5 == 0:
+            logger.info(f"BlackHole Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.blackhole_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
+            
+    except Exception as e:
+        # Логируем ошибки PortAudio для отладки
+        logger.warning(f"BlackHole Callback error: {e}")
+        # Очищаем буфер при ошибке
+        STATE.blackhole_buffer.clear()
+        # Устанавливаем флаг для перезапуска потока
+        STATE.audio_stream_error = True
+
+def mic_callback(indata, frames, time_info, status):
+    try:
+        # Всегда обновляем буфер для уровней - быстро и без блокировок
+        last = indata[:, 0] if indata.ndim > 1 else indata
+        STATE.mic_buffer.extend(last.tolist())
+        
+        # Ограничиваем размер буфера для быстрого обновления PPM
+        if len(STATE.mic_buffer) > 512:
+            STATE.mic_buffer = STATE.mic_buffer[-256:]
+        
+        # Логируем для отладки каждые 5 секунд (уменьшаем частоту)
+        if int(time.time()) % 5 == 0:
+            logger.info(f"Mic Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.mic_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
+            
+    except Exception as e:
+        # Логируем ошибки PortAudio для отладки
+        logger.warning(f"Mic Callback error: {e}")
+        # Очищаем буфер при ошибке
+        STATE.mic_buffer.clear()
+        # Устанавливаем флаг для перезапуска потока
+        STATE.audio_stream_error = True
+
 # ================== ПОТОКИ ==================
 def pump_transcript_thread():
     """Перекачивает строки из очереди в общий текст и WS."""
@@ -278,8 +323,8 @@ def levels_thread():
                 ws_broadcast_levels(STATE.mic_db, STATE.blackhole_db)
                 time.sleep(0.05)  # 20 Гц в режиме ожидания
                 
-            # Отладочная информация каждые 5 секунд
-            if int(time.time()) % 5 == 0:
+            # Отладочная информация каждые 10 секунд (уменьшаем частоту)
+            if int(time.time()) % 10 == 0:
                 logger.info(f"Levels Thread: mic={STATE.mic_db:.1f}dB, blackhole={STATE.blackhole_db:.1f}dB, mic_buffer_len={len(STATE.mic_buffer)}, blackhole_buffer_len={len(STATE.blackhole_buffer)}")
                 logger.info(f"Levels Thread: recording={STATE.recording}, paused={STATE.paused}, stop_event={STATE.stop_event.is_set()}")
             
@@ -294,51 +339,6 @@ def levels_thread():
         except Exception as e:
             logger.error(f"Levels thread error: {e}")
             time.sleep(0.1)
-
-# Глобальные callback функции для PPM уровней
-def blackhole_callback(indata, frames, time_info, status):
-    try:
-        # Всегда обновляем буфер для уровней - быстро и без блокировок
-        last = indata[:, 0] if indata.ndim > 1 else indata
-        STATE.blackhole_buffer.extend(last.tolist())
-        
-        # Ограничиваем размер буфера для быстрого обновления PPM
-        if len(STATE.blackhole_buffer) > 2048:
-            del STATE.blackhole_buffer[:-512]
-        
-        # Логируем для отладки каждые 2 секунды
-        if int(time.time()) % 2 == 0:
-            logger.info(f"BlackHole Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.blackhole_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
-            
-    except Exception as e:
-        # Логируем ошибки PortAudio для отладки
-        logger.warning(f"BlackHole Callback error: {e}")
-        # Очищаем буфер при ошибке
-        STATE.blackhole_buffer.clear()
-        # Устанавливаем флаг для перезапуска потока
-        STATE.audio_stream_error = True
-
-def mic_callback(indata, frames, time_info, status):
-    try:
-        # Всегда обновляем буфер для уровней - быстро и без блокировок
-        last = indata[:, 0] if indata.ndim > 1 else indata
-        STATE.mic_buffer.extend(last.tolist())
-        
-        # Ограничиваем размер буфера для быстрого обновления PPM
-        if len(STATE.mic_buffer) > 2048:
-            del STATE.mic_buffer[:-512]
-        
-        # Логируем для отладки каждые 2 секунды
-        if int(time.time()) % 2 == 0:
-            logger.info(f"Mic Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.mic_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
-            
-    except Exception as e:
-        # Логируем ошибки PortAudio для отладки
-        logger.warning(f"Mic Callback error: {e}")
-        # Очищаем буфер при ошибке
-        STATE.mic_buffer.clear()
-        # Устанавливаем флаг для перезапуска потока
-        STATE.audio_stream_error = True
 
 def recording_thread():
     st = STATE
@@ -359,20 +359,28 @@ def recording_thread():
     segment_count = 0
     segment_start = time.time()
 
-    # Локальные callback функции для записи аудио
+    # Локальные callback функции для записи
     def blackhole_recording_callback(indata, frames, time_info, status):
         try:
             if st.recording and not st.paused and not st.stop_event.is_set():
                 blackhole_recording.append(indata.copy() * st.blackhole_gain)
+            
+            # Вызываем глобальный callback для уровней
+            blackhole_callback(indata, frames, time_info, status)
+                
         except Exception as e:
-            logger.warning(f"BlackHole recording callback error: {e}")
+            logger.warning(f"BlackHole Recording Callback error: {e}")
 
     def mic_recording_callback(indata, frames, time_info, status):
         try:
             if st.recording and not st.paused and not st.stop_event.is_set():
                 mic_recording.append(indata.copy() * st.mic_gain)
+            
+            # Вызываем глобальный callback для уровней
+            mic_callback(indata, frames, time_info, status)
+                
         except Exception as e:
-            logger.warning(f"Mic recording callback error: {e}")
+            logger.warning(f"Mic Recording Callback error: {e}")
 
     try:
         st.blackhole_stream = sd.InputStream(
@@ -464,7 +472,7 @@ def transcribe_thread():
             logger.info("Модель GigaAM v2 RNNT успешно загружена")
         except Exception as model_error:
             logger.error(f"Ошибка загрузки модели GigaAM: {model_error}")
-            logger.info("Попробуйте другие модели: gigaam.list_models()")
+            logger.info(f"Доступные модели: {gigaam._MODEL_NAMES}")
             return
             
     except Exception as e:
@@ -572,30 +580,30 @@ def api_select_mic(body: MicrophoneSelect):
     old_mic = STATE.current_mic
     STATE.current_mic = body.name
     
-    # если идет запись и не на паузе — пересоздадим MIC stream на лету
+    # Переключение микрофона во время записи - безопасное пересоздание потока
     if STATE.recording and not STATE.paused and STATE.mic_stream:
         try:
-            logger.info(f"API: Recreating microphone stream during recording...")
+            logger.info(f"API: Switching microphone during recording from '{old_mic}' to '{STATE.current_mic}'")
             
             # Останавливаем и закрываем старый стрим
             STATE.mic_stream.stop()
             STATE.mic_stream.close()
             
-            # Создаем новый стрим с новым микрофоном и тем же callback
+            # Создаем новый стрим с новым микрофоном
             STATE.mic_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, 
                 channels=1, 
                 device=STATE.current_mic,
-                callback=mic_callback  # Используем глобальную функцию из recording_thread
+                callback=mic_callback
             )
             STATE.mic_stream.start()
             
-            logger.info(f"Микрофон переключен с '{old_mic}' на '{STATE.current_mic}' во время записи")
+            logger.info(f"API: Microphone switched successfully during recording")
         except Exception as e:
-            logger.error(f"Ошибка переключения микрофона: {e}")
+            logger.error(f"API: Error switching microphone during recording: {e}")
             # Возвращаем старый микрофон в случае ошибки
             STATE.current_mic = old_mic
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=f"Ошибка переключения микрофона: {str(e)}")
     
     return {"ok": True, "selected": STATE.current_mic}
 
@@ -681,31 +689,39 @@ def api_resume():
 
 @app.post("/api/record/stop")
 def api_stop():
+    logger.info("API: Stop recording request received")
     if not STATE.recording:
+        logger.info("API: Not recording, returning OK")
         return {"ok": True}
     
     try:
+        logger.info("API: Setting stop flags...")
         STATE.recording = False
         STATE.stop_event.set()
 
         # корректно закрываем стримы
+        logger.info("API: Closing audio streams...")
         try:
             if STATE.blackhole_stream:
+                logger.info("API: Stopping blackhole stream...")
                 STATE.blackhole_stream.stop()
                 STATE.blackhole_stream.close()
                 STATE.blackhole_stream = None
+                logger.info("API: Blackhole stream closed")
             if STATE.mic_stream:
+                logger.info("API: Stopping mic stream...")
                 STATE.mic_stream.stop()
                 STATE.mic_stream.close()
                 STATE.mic_stream = None
+                logger.info("API: Mic stream closed")
         except Exception as e:
-            logger.warning(f"Закрытие стримов: {e}")
+            logger.warning(f"API: Error closing streams: {e}")
 
-        # дождемся очередей
-        # (не блокируем HTTP — фоновые потоки сами дольют и завершатся)
+        # Потоки завершатся сами в фоне
+        logger.info("API: Recording stopped successfully")
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка остановки записи: {e}")
+        logger.error(f"API: Error stopping recording: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.patch("/api/settings")
