@@ -295,6 +295,51 @@ def levels_thread():
             logger.error(f"Levels thread error: {e}")
             time.sleep(0.1)
 
+# Глобальные callback функции для PPM уровней
+def blackhole_callback(indata, frames, time_info, status):
+    try:
+        # Всегда обновляем буфер для уровней - быстро и без блокировок
+        last = indata[:, 0] if indata.ndim > 1 else indata
+        STATE.blackhole_buffer.extend(last.tolist())
+        
+        # Ограничиваем размер буфера для быстрого обновления PPM
+        if len(STATE.blackhole_buffer) > 2048:
+            del STATE.blackhole_buffer[:-512]
+        
+        # Логируем для отладки каждые 2 секунды
+        if int(time.time()) % 2 == 0:
+            logger.info(f"BlackHole Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.blackhole_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
+            
+    except Exception as e:
+        # Логируем ошибки PortAudio для отладки
+        logger.warning(f"BlackHole Callback error: {e}")
+        # Очищаем буфер при ошибке
+        STATE.blackhole_buffer.clear()
+        # Устанавливаем флаг для перезапуска потока
+        STATE.audio_stream_error = True
+
+def mic_callback(indata, frames, time_info, status):
+    try:
+        # Всегда обновляем буфер для уровней - быстро и без блокировок
+        last = indata[:, 0] if indata.ndim > 1 else indata
+        STATE.mic_buffer.extend(last.tolist())
+        
+        # Ограничиваем размер буфера для быстрого обновления PPM
+        if len(STATE.mic_buffer) > 2048:
+            del STATE.mic_buffer[:-512]
+        
+        # Логируем для отладки каждые 2 секунды
+        if int(time.time()) % 2 == 0:
+            logger.info(f"Mic Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.mic_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
+            
+    except Exception as e:
+        # Логируем ошибки PortAudio для отладки
+        logger.warning(f"Mic Callback error: {e}")
+        # Очищаем буфер при ошибке
+        STATE.mic_buffer.clear()
+        # Устанавливаем флаг для перезапуска потока
+        STATE.audio_stream_error = True
+
 def recording_thread():
     st = STATE
     # ищем устройство BlackHole
@@ -314,63 +359,27 @@ def recording_thread():
     segment_count = 0
     segment_start = time.time()
 
-    # Глобальные callback функции для потоков
-    def blackhole_callback(indata, frames, time_info, status):
+    # Локальные callback функции для записи аудио
+    def blackhole_recording_callback(indata, frames, time_info, status):
         try:
             if st.recording and not st.paused and not st.stop_event.is_set():
                 blackhole_recording.append(indata.copy() * st.blackhole_gain)
-            
-            # Всегда обновляем буфер для уровней - быстро и без блокировок
-            last = indata[:, 0] if indata.ndim > 1 else indata
-            STATE.blackhole_buffer.extend(last.tolist())
-            
-            # Ограничиваем размер буфера для быстрого обновления PPM
-            if len(STATE.blackhole_buffer) > 2048:
-                del STATE.blackhole_buffer[:-512]
-            
-            # Логируем для отладки каждые 2 секунды
-            if int(time.time()) % 2 == 0:
-                logger.info(f"BlackHole Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.blackhole_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
-                
         except Exception as e:
-            # Логируем ошибки PortAudio для отладки
-            logger.warning(f"BlackHole Callback error: {e}")
-            # Очищаем буфер при ошибке
-            STATE.blackhole_buffer.clear()
-            # Устанавливаем флаг для перезапуска потока
-            STATE.audio_stream_error = True
+            logger.warning(f"BlackHole recording callback error: {e}")
 
-    def mic_callback(indata, frames, time_info, status):
+    def mic_recording_callback(indata, frames, time_info, status):
         try:
             if st.recording and not st.paused and not st.stop_event.is_set():
                 mic_recording.append(indata.copy() * st.mic_gain)
-            
-            # Всегда обновляем буфер для уровней - быстро и без блокировок
-            last = indata[:, 0] if indata.ndim > 1 else indata
-            STATE.mic_buffer.extend(last.tolist())
-            
-            # Ограничиваем размер буфера для быстрого обновления PPM
-            if len(STATE.mic_buffer) > 2048:
-                del STATE.mic_buffer[:-512]
-            
-            # Логируем для отладки каждые 2 секунды
-            if int(time.time()) % 2 == 0:
-                logger.info(f"Mic Callback: frames={frames}, data_shape={indata.shape}, buffer_len={len(STATE.mic_buffer)}, max_amplitude={np.max(np.abs(last)):.6f}")
-                
         except Exception as e:
-            # Логируем ошибки PortAudio для отладки
-            logger.warning(f"Mic Callback error: {e}")
-            # Очищаем буфер при ошибке
-            STATE.mic_buffer.clear()
-            # Устанавливаем флаг для перезапуска потока
-            STATE.audio_stream_error = True
+            logger.warning(f"Mic recording callback error: {e}")
 
     try:
         st.blackhole_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, device=blackhole_device, callback=blackhole_callback
+            samplerate=SAMPLE_RATE, channels=1, device=blackhole_device, callback=blackhole_recording_callback
         )
         st.mic_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, device=st.current_mic, callback=mic_callback
+            samplerate=SAMPLE_RATE, channels=1, device=st.current_mic, callback=mic_recording_callback
         )
 
         with st.blackhole_stream, st.mic_stream:
