@@ -6,3 +6,4 @@
 /temp_segments/
 /gigachat_config.json
 /env.example
+__pycache__/main.cpython-312.pyc
