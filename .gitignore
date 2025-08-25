@@ -4,3 +4,5 @@
 /transcript.txt
 /meeting_audio.wav
 /temp_segments/
+/gigachat_config.json
+/env.example
